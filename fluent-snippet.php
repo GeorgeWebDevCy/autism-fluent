@@ -1,6 +1,6 @@
 /**
  * Plugin Name: GN Forminator → WooCommerce Subscriptions Bridge (Debug)
- * Description: Forminator form (ID 3406) collects onboarding questions and saves answers to WooCommerce Order + Subscription. Includes robust AJAX-safe debugging.
+ * Description: Forminator membership form collects onboarding questions and routes successful submissions into WooCommerce checkout. Includes robust AJAX-safe debugging.
  * Version: 1.0.1
  * Author: GN
  */
@@ -8,6 +8,8 @@
 if (!defined('ABSPATH')) exit;
 
 define('GN_FM_FORM_ID', 3403);
+define('GN_FM_COMPAT_FORM_IDS', [3406]);
+define('GN_FM_PRODUCT_ID', 3378);
 
 // Turn this to false when done debugging
 if (!defined('GN_FM_DEBUG')) define('GN_FM_DEBUG', true);
@@ -25,6 +27,27 @@ function gn_fm_log($msg, $data = null) {
   } else {
     error_log('[GN_FM] ' . $msg);
   }
+}
+
+/**
+ * ------------------------------------------------------------
+ * Form / checkout helpers
+ * ------------------------------------------------------------
+ */
+function gn_fm_get_target_form_ids() {
+  return array_values(array_unique(array_map('intval', array_merge([GN_FM_FORM_ID], GN_FM_COMPAT_FORM_IDS))));
+}
+
+function gn_fm_is_target_form($form_id) {
+  return in_array((int) $form_id, gn_fm_get_target_form_ids(), true);
+}
+
+function gn_fm_get_checkout_add_to_cart_url() {
+  $checkout_url = function_exists('wc_get_checkout_url')
+    ? wc_get_checkout_url()
+    : home_url('/checkout/');
+
+  return add_query_arg('add-to-cart', (int) GN_FM_PRODUCT_ID, $checkout_url);
 }
 
 /**
@@ -71,6 +94,44 @@ function gn_fm_get_field_value($field_data, $element_id) {
 
 /**
  * ------------------------------------------------------------
+ * Force successful submits into WooCommerce checkout
+ * ------------------------------------------------------------
+ */
+function gn_fm_force_checkout_redirect($response, $form_id) {
+  if (!is_array($response) || empty($response['success']) || !gn_fm_is_target_form($form_id)) {
+    return $response;
+  }
+
+  $checkout_url = gn_fm_get_checkout_add_to_cart_url();
+
+  $response['redirect'] = true;
+  $response['behav']    = 'behaviour-redirect';
+  $response['url']      = $checkout_url;
+  $response['newtab']   = 'sametab';
+
+  gn_fm_log('Overrode submit redirect to checkout', [
+    'form_id'      => (int) $form_id,
+    'product_id'   => (int) GN_FM_PRODUCT_ID,
+    'checkout_url' => $checkout_url,
+  ]);
+
+  return $response;
+}
+
+function gn_fm_force_checkout_submit_url($url, $form_id) {
+  if (!gn_fm_is_target_form($form_id)) {
+    return $url;
+  }
+
+  return gn_fm_get_checkout_add_to_cart_url();
+}
+
+add_filter('forminator_custom_form_ajax_submit_response', 'gn_fm_force_checkout_redirect', 20, 2);
+add_filter('forminator_custom_form_submit_response', 'gn_fm_force_checkout_redirect', 20, 2);
+add_filter('forminator_custom_form_submit_url', 'gn_fm_force_checkout_submit_url', 20, 2);
+
+/**
+ * ------------------------------------------------------------
  * 1) Capture Forminator submission safely (AJAX-friendly)
  * ------------------------------------------------------------
  *
@@ -108,7 +169,7 @@ function gn_fm_store_submission_compat(...$args) {
     'doing_ajax'  => function_exists('wp_doing_ajax') ? wp_doing_ajax() : null,
   ]);
 
-  if ((int)$form_id !== (int) GN_FM_FORM_ID) return;
+  if (!gn_fm_is_target_form($form_id)) return;
   if (!$entry_id) return;
 
   // Build payload (field IDs from your export)
@@ -175,7 +236,7 @@ add_action('wp_loaded', function () {
   $entry_id = isset($_COOKIE['gn_fm_entry_id']) ? (int) $_COOKIE['gn_fm_entry_id'] : 0;
   $form_id  = isset($_COOKIE['gn_fm_form_id'])  ? (int) $_COOKIE['gn_fm_form_id']  : 0;
 
-  if ($entry_id && (int)$form_id === (int) GN_FM_FORM_ID) {
+  if ($entry_id && gn_fm_is_target_form($form_id)) {
     $t = get_transient('gn_fm_payload_' . $entry_id);
     if (is_array($t) && !empty($t['entry_id'])) {
       WC()->session->set('gn_fm_payload', $t);
@@ -218,7 +279,7 @@ add_action('woocommerce_checkout_create_order', function ($order, $data) {
 
   gn_fm_log('checkout_create_order payload', $payload);
 
-  if (empty($payload) || empty($payload['entry_id']) || (int)($payload['form_id'] ?? 0) !== (int) GN_FM_FORM_ID) {
+  if (empty($payload) || empty($payload['entry_id']) || !gn_fm_is_target_form((int) ($payload['form_id'] ?? 0))) {
     return;
   }
 
@@ -261,7 +322,7 @@ add_action('woocommerce_checkout_subscription_created', function ($subscription,
 
   gn_fm_log('subscription_created', ['form_id' => $form_id, 'entry_id' => $entry_id]);
 
-  if ($form_id !== (int) GN_FM_FORM_ID || !$entry_id) return;
+  if (!gn_fm_is_target_form($form_id) || !$entry_id) return;
 
   // Copy identifiers
   $subscription->update_meta_data('_gn_forminator_form_id', $form_id);
@@ -301,7 +362,7 @@ add_action('woocommerce_admin_order_data_after_billing_address', function ($orde
   $entry_id = $order->get_meta('_gn_forminator_entry_id');
   $form_id  = $order->get_meta('_gn_forminator_form_id');
 
-  if (!$entry_id || (int)$form_id !== (int) GN_FM_FORM_ID) return;
+  if (!$entry_id || !gn_fm_is_target_form($form_id)) return;
 
   $lines = [
     'Όνομα'           => $order->get_meta('_gn_member_first_name'),
@@ -361,5 +422,5 @@ add_action('woocommerce_thankyou', function ($order_id) {
  */
 add_action('wp_footer', function () {
   if (!GN_FM_DEBUG) return;
-  echo "<script>console.log('GN_FM debug plugin active (form " . (int)GN_FM_FORM_ID . ").');</script>";
+  echo "<script>console.log('GN_FM debug plugin active (forms " . esc_js(implode(', ', gn_fm_get_target_form_ids())) . ", product " . (int) GN_FM_PRODUCT_ID . ").');</script>";
 }, 999);
